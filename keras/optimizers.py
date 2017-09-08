@@ -1,38 +1,48 @@
 from __future__ import absolute_import
-from . import backend as K
-from .utils.generic_utils import get_from_module
+import six
+import copy
 from six.moves import zip
+
+from . import backend as K
+from .utils.generic_utils import serialize_keras_object
+from .utils.generic_utils import deserialize_keras_object
+from .legacy import interfaces
+
+if K.backend() == 'tensorflow':
+    import tensorflow as tf
 
 
 def clip_norm(g, c, n):
-    if c > 0:
-        g = K.switch(n >= c, g * c / n, g)
+    if c <= 0:  # if clipnorm == 0 no need to add ops to the graph
+        return g
+
+    # tf require using a special op to multiply IndexedSliced by scalar
+    if K.backend() == 'tensorflow':
+        condition = n >= c
+        then_expression = tf.scalar_mul(c / n, g)
+        else_expression = g
+
+        # saving the shape to avoid converting sparse tensor to dense
+        if isinstance(then_expression, tf.Tensor):
+            g_shape = copy.copy(then_expression.get_shape())
+        elif isinstance(then_expression, tf.IndexedSlices):
+            g_shape = copy.copy(then_expression.dense_shape)
+        if condition.dtype != tf.bool:
+            condition = tf.cast(condition, 'bool')
+        g = tf.cond(condition,
+                    lambda: then_expression,
+                    lambda: else_expression)
+        if isinstance(then_expression, tf.Tensor):
+            g.set_shape(g_shape)
+        elif isinstance(then_expression, tf.IndexedSlices):
+            g._dense_shape = g_shape
+    else:
+        g = K.switch(K.greater_equal(n, c), g * c / n, g)
     return g
 
 
-def optimizer_from_config(config, custom_objects=None):
-    all_classes = {
-        'sgd': SGD,
-        'rmsprop': RMSprop,
-        'adagrad': Adagrad,
-        'adadelta': Adadelta,
-        'adam': Adam,
-        'adamax': Adamax,
-        'nadam': Nadam,
-        'tfoptimizer': TFOptimizer,
-    }
-    class_name = config['class_name']
-    if custom_objects and class_name in custom_objects:
-        cls = custom_objects[class_name]
-    else:
-        if class_name.lower() not in all_classes:
-            raise ValueError('Optimizer class not found:', class_name)
-        cls = all_classes[class_name.lower()]
-    return cls.from_config(config['config'])
-
-
 class Optimizer(object):
-    '''Abstract optimizer base class.
+    """Abstract optimizer base class.
 
     Note: this is the parent class of all optimizers, not an actual optimizer
     that can be used for training models.
@@ -43,7 +53,8 @@ class Optimizer(object):
             when their L2 norm exceeds this value.
         clipvalue: float >= 0. Gradients will be clipped
             when their absolute value exceeds this value.
-    '''
+    """
+
     def __init__(self, **kwargs):
         allowed_kwargs = {'clipnorm', 'clipvalue'}
         for k in kwargs:
@@ -54,7 +65,8 @@ class Optimizer(object):
         self.updates = []
         self.weights = []
 
-    def get_updates(self, params, constraints, loss):
+    @interfaces.legacy_get_updates_support
+    def get_updates(self, loss, params):
         raise NotImplementedError
 
     def get_gradients(self, loss, params):
@@ -67,7 +79,7 @@ class Optimizer(object):
         return grads
 
     def set_weights(self, weights):
-        '''Sets the weights of the optimizer, from Numpy arrays.
+        """Sets the weights of the optimizer, from Numpy arrays.
 
         Should only be called after computing the gradients
         (otherwise the optimizer has no weights).
@@ -78,7 +90,10 @@ class Optimizer(object):
                 number of the dimensions of the weights
                 of the optimizer (i.e. it should match the
                 output of `get_weights`).
-        '''
+
+        # Raises
+            ValueError: in case of incompatible weight shapes.
+        """
         params = self.weights
         weight_value_tuples = []
         param_values = K.batch_get_value(params)
@@ -92,9 +107,11 @@ class Optimizer(object):
         K.batch_set_value(weight_value_tuples)
 
     def get_weights(self):
-        '''Returns the current weights of the optimizer,
-        as a list of numpy arrays.
-        '''
+        """Returns the current value of the weights of the optimizer.
+
+        # Returns
+            A list of numpy arrays.
+        """
         return K.batch_get_value(self.weights)
 
     def get_config(self):
@@ -111,7 +128,9 @@ class Optimizer(object):
 
 
 class SGD(Optimizer):
-    '''Stochastic gradient descent, with support for momentum,
+    """Stochastic gradient descent optimizer.
+
+    Includes support for momentum,
     learning rate decay, and Nesterov momentum.
 
     # Arguments
@@ -119,28 +138,30 @@ class SGD(Optimizer):
         momentum: float >= 0. Parameter updates momentum.
         decay: float >= 0. Learning rate decay over each update.
         nesterov: boolean. Whether to apply Nesterov momentum.
-    '''
+    """
+
     def __init__(self, lr=0.01, momentum=0., decay=0.,
                  nesterov=False, **kwargs):
         super(SGD, self).__init__(**kwargs)
-        self.__dict__.update(locals())
-        self.iterations = K.variable(0.)
-        self.lr = K.variable(lr)
-        self.momentum = K.variable(momentum)
-        self.decay = K.variable(decay)
-        self.inital_decay = decay
+        with K.name_scope(self.__class__.__name__):
+            self.iterations = K.variable(0, dtype='int64', name='iterations')
+            self.lr = K.variable(lr, name='lr')
+            self.momentum = K.variable(momentum, name='momentum')
+            self.decay = K.variable(decay, name='decay')
+        self.initial_decay = decay
+        self.nesterov = nesterov
 
-    def get_updates(self, params, constraints, loss):
+    @interfaces.legacy_get_updates_support
+    def get_updates(self, loss, params):
         grads = self.get_gradients(loss, params)
-        self.updates = []
+        self.updates = [K.update_add(self.iterations, 1)]
 
         lr = self.lr
-        if self.inital_decay > 0:
-            lr *= (1. / (1. + self.decay * self.iterations))
-            self.updates .append(K.update_add(self.iterations, 1))
-
+        if self.initial_decay > 0:
+            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
+                                                  K.dtype(self.decay))))
         # momentum
-        shapes = [K.get_variable_shape(p) for p in params]
+        shapes = [K.int_shape(p) for p in params]
         moments = [K.zeros(shape) for shape in shapes]
         self.weights = [self.iterations] + moments
         for p, g, m in zip(params, grads, moments):
@@ -152,10 +173,9 @@ class SGD(Optimizer):
             else:
                 new_p = p + v
 
-            # apply constraints
-            if p in constraints:
-                c = constraints[p]
-                new_p = c(new_p)
+            # Apply constraints.
+            if getattr(p, 'constraint', None) is not None:
+                new_p = p.constraint(new_p)
 
             self.updates.append(K.update(p, new_p))
         return self.updates
@@ -170,7 +190,7 @@ class SGD(Optimizer):
 
 
 class RMSprop(Optimizer):
-    '''RMSProp optimizer.
+    """RMSProp optimizer.
 
     It is recommended to leave the parameters of this optimizer
     at their default values
@@ -184,28 +204,33 @@ class RMSprop(Optimizer):
         rho: float >= 0.
         epsilon: float >= 0. Fuzz factor.
         decay: float >= 0. Learning rate decay over each update.
-    '''
+
+    # References
+        - [rmsprop: Divide the gradient by a running average of its recent magnitude](http://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf)
+    """
+
     def __init__(self, lr=0.001, rho=0.9, epsilon=1e-8, decay=0.,
                  **kwargs):
         super(RMSprop, self).__init__(**kwargs)
-        self.__dict__.update(locals())
-        self.lr = K.variable(lr)
-        self.rho = K.variable(rho)
-        self.decay = K.variable(decay)
-        self.inital_decay = decay
-        self.iterations = K.variable(0.)
+        with K.name_scope(self.__class__.__name__):
+            self.lr = K.variable(lr, name='lr')
+            self.rho = K.variable(rho, name='rho')
+            self.decay = K.variable(decay, name='decay')
+            self.iterations = K.variable(0, dtype='int64', name='iterations')
+        self.epsilon = epsilon
+        self.initial_decay = decay
 
-    def get_updates(self, params, constraints, loss):
+    @interfaces.legacy_get_updates_support
+    def get_updates(self, loss, params):
         grads = self.get_gradients(loss, params)
-        shapes = [K.get_variable_shape(p) for p in params]
-        accumulators = [K.zeros(shape) for shape in shapes]
+        accumulators = [K.zeros(K.int_shape(p), dtype=K.dtype(p)) for p in params]
         self.weights = accumulators
-        self.updates = []
+        self.updates = [K.update_add(self.iterations, 1)]
 
         lr = self.lr
-        if self.inital_decay > 0:
-            lr *= (1. / (1. + self.decay * self.iterations))
-            self.updates.append(K.update_add(self.iterations, 1))
+        if self.initial_decay > 0:
+            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
+                                                  K.dtype(self.decay))))
 
         for p, g, a in zip(params, grads, accumulators):
             # update accumulator
@@ -213,10 +238,10 @@ class RMSprop(Optimizer):
             self.updates.append(K.update(a, new_a))
             new_p = p - lr * g / (K.sqrt(new_a) + self.epsilon)
 
-            # apply constraints
-            if p in constraints:
-                c = constraints[p]
-                new_p = c(new_p)
+            # Apply constraints.
+            if getattr(p, 'constraint', None) is not None:
+                new_p = p.constraint(new_p)
+
             self.updates.append(K.update(p, new_p))
         return self.updates
 
@@ -230,7 +255,7 @@ class RMSprop(Optimizer):
 
 
 class Adagrad(Optimizer):
-    '''Adagrad optimizer.
+    """Adagrad optimizer.
 
     It is recommended to leave the parameters of this optimizer
     at their default values.
@@ -238,38 +263,43 @@ class Adagrad(Optimizer):
     # Arguments
         lr: float >= 0. Learning rate.
         epsilon: float >= 0.
+        decay: float >= 0. Learning rate decay over each update.
 
     # References
         - [Adaptive Subgradient Methods for Online Learning and Stochastic Optimization](http://www.jmlr.org/papers/volume12/duchi11a/duchi11a.pdf)
-    '''
+    """
+
     def __init__(self, lr=0.01, epsilon=1e-8, decay=0., **kwargs):
         super(Adagrad, self).__init__(**kwargs)
-        self.__dict__.update(locals())
-        self.lr = K.variable(lr)
-        self.decay = K.variable(decay)
-        self.inital_decay = decay
-        self.iterations = K.variable(0.)
+        with K.name_scope(self.__class__.__name__):
+            self.lr = K.variable(lr, name='lr')
+            self.decay = K.variable(decay, name='decay')
+            self.iterations = K.variable(0, dtype='int64', name='iterations')
+        self.epsilon = epsilon
+        self.initial_decay = decay
 
-    def get_updates(self, params, constraints, loss):
+    @interfaces.legacy_get_updates_support
+    def get_updates(self, loss, params):
         grads = self.get_gradients(loss, params)
-        shapes = [K.get_variable_shape(p) for p in params]
+        shapes = [K.int_shape(p) for p in params]
         accumulators = [K.zeros(shape) for shape in shapes]
         self.weights = accumulators
-        self.updates = []
+        self.updates = [K.update_add(self.iterations, 1)]
 
         lr = self.lr
-        if self.inital_decay > 0:
-            lr *= (1. / (1. + self.decay * self.iterations))
-            self.updates.append(K.update_add(self.iterations, 1))
+        if self.initial_decay > 0:
+            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
+                                                  K.dtype(self.decay))))
 
         for p, g, a in zip(params, grads, accumulators):
             new_a = a + K.square(g)  # update accumulator
             self.updates.append(K.update(a, new_a))
             new_p = p - lr * g / (K.sqrt(new_a) + self.epsilon)
-            # apply constraints
-            if p in constraints:
-                c = constraints[p]
-                new_p = c(new_p)
+
+            # Apply constraints.
+            if getattr(p, 'constraint', None) is not None:
+                new_p = p.constraint(new_p)
+
             self.updates.append(K.update(p, new_p))
         return self.updates
 
@@ -282,7 +312,7 @@ class Adagrad(Optimizer):
 
 
 class Adadelta(Optimizer):
-    '''Adadelta optimizer.
+    """Adadelta optimizer.
 
     It is recommended to leave the parameters of this optimizer
     at their default values.
@@ -292,31 +322,36 @@ class Adadelta(Optimizer):
             It is recommended to leave it at the default value.
         rho: float >= 0.
         epsilon: float >= 0. Fuzz factor.
+        decay: float >= 0. Learning rate decay over each update.
 
     # References
         - [Adadelta - an adaptive learning rate method](http://arxiv.org/abs/1212.5701)
-    '''
+    """
+
     def __init__(self, lr=1.0, rho=0.95, epsilon=1e-8, decay=0.,
                  **kwargs):
         super(Adadelta, self).__init__(**kwargs)
-        self.__dict__.update(locals())
-        self.lr = K.variable(lr)
-        self.decay = K.variable(decay)
-        self.inital_decay = decay
-        self.iterations = K.variable(0.)
+        with K.name_scope(self.__class__.__name__):
+            self.lr = K.variable(lr, name='lr')
+            self.decay = K.variable(decay, name='decay')
+            self.iterations = K.variable(0, dtype='int64', name='iterations')
+        self.rho = rho
+        self.epsilon = epsilon
+        self.initial_decay = decay
 
-    def get_updates(self, params, constraints, loss):
+    @interfaces.legacy_get_updates_support
+    def get_updates(self, loss, params):
         grads = self.get_gradients(loss, params)
-        shapes = [K.get_variable_shape(p) for p in params]
+        shapes = [K.int_shape(p) for p in params]
         accumulators = [K.zeros(shape) for shape in shapes]
         delta_accumulators = [K.zeros(shape) for shape in shapes]
         self.weights = accumulators + delta_accumulators
-        self.updates = []
+        self.updates = [K.update_add(self.iterations, 1)]
 
         lr = self.lr
-        if self.inital_decay > 0:
-            lr *= (1. / (1. + self.decay * self.iterations))
-            self.updates.append(K.update_add(self.iterations, 1))
+        if self.initial_decay > 0:
+            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
+                                                  K.dtype(self.decay))))
 
         for p, g, a, d_a in zip(params, grads, accumulators, delta_accumulators):
             # update accumulator
@@ -325,12 +360,12 @@ class Adadelta(Optimizer):
 
             # use the new accumulator and the *old* delta_accumulator
             update = g * K.sqrt(d_a + self.epsilon) / K.sqrt(new_a + self.epsilon)
-
             new_p = p - lr * update
-            # apply constraints
-            if p in constraints:
-                c = constraints[p]
-                new_p = c(new_p)
+
+            # Apply constraints.
+            if getattr(p, 'constraint', None) is not None:
+                new_p = p.constraint(new_p)
+
             self.updates.append(K.update(p, new_p))
 
             # update delta_accumulator
@@ -348,43 +383,49 @@ class Adadelta(Optimizer):
 
 
 class Adam(Optimizer):
-    '''Adam optimizer.
+    """Adam optimizer.
 
     Default parameters follow those provided in the original paper.
 
     # Arguments
         lr: float >= 0. Learning rate.
-        beta_1/beta_2: floats, 0 < beta < 1. Generally close to 1.
+        beta_1: float, 0 < beta < 1. Generally close to 1.
+        beta_2: float, 0 < beta < 1. Generally close to 1.
         epsilon: float >= 0. Fuzz factor.
+        decay: float >= 0. Learning rate decay over each update.
 
     # References
         - [Adam - A Method for Stochastic Optimization](http://arxiv.org/abs/1412.6980v8)
-    '''
+    """
+
     def __init__(self, lr=0.001, beta_1=0.9, beta_2=0.999,
                  epsilon=1e-8, decay=0., **kwargs):
         super(Adam, self).__init__(**kwargs)
-        self.__dict__.update(locals())
-        self.iterations = K.variable(0)
-        self.lr = K.variable(lr)
-        self.beta_1 = K.variable(beta_1)
-        self.beta_2 = K.variable(beta_2)
-        self.decay = K.variable(decay)
-        self.inital_decay = decay
+        with K.name_scope(self.__class__.__name__):
+            self.iterations = K.variable(0, dtype='int64', name='iterations')
+            self.lr = K.variable(lr, name='lr')
+            self.beta_1 = K.variable(beta_1, name='beta_1')
+            self.beta_2 = K.variable(beta_2, name='beta_2')
+            self.decay = K.variable(decay, name='decay')
+        self.epsilon = epsilon
+        self.initial_decay = decay
 
-    def get_updates(self, params, constraints, loss):
+    @interfaces.legacy_get_updates_support
+    def get_updates(self, loss, params):
         grads = self.get_gradients(loss, params)
         self.updates = [K.update_add(self.iterations, 1)]
 
         lr = self.lr
-        if self.inital_decay > 0:
-            lr *= (1. / (1. + self.decay * self.iterations))
+        if self.initial_decay > 0:
+            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
+                                                  K.dtype(self.decay))))
 
-        t = self.iterations + 1
-        lr_t = lr * K.sqrt(1. - K.pow(self.beta_2, t)) / (1. - K.pow(self.beta_1, t))
+        t = K.cast(self.iterations, K.floatx()) + 1
+        lr_t = lr * (K.sqrt(1. - K.pow(self.beta_2, t)) /
+                     (1. - K.pow(self.beta_1, t)))
 
-        shapes = [K.get_variable_shape(p) for p in params]
-        ms = [K.zeros(shape) for shape in shapes]
-        vs = [K.zeros(shape) for shape in shapes]
+        ms = [K.zeros(K.int_shape(p), dtype=K.dtype(p)) for p in params]
+        vs = [K.zeros(K.int_shape(p), dtype=K.dtype(p)) for p in params]
         self.weights = [self.iterations] + ms + vs
 
         for p, g, m, v in zip(params, grads, ms, vs):
@@ -394,12 +435,12 @@ class Adam(Optimizer):
 
             self.updates.append(K.update(m, m_t))
             self.updates.append(K.update(v, v_t))
-
             new_p = p_t
-            # apply constraints
-            if p in constraints:
-                c = constraints[p]
-                new_p = c(new_p)
+
+            # Apply constraints.
+            if getattr(p, 'constraint', None) is not None:
+                new_p = p.constraint(new_p)
+
             self.updates.append(K.update(p, new_p))
         return self.updates
 
@@ -414,42 +455,47 @@ class Adam(Optimizer):
 
 
 class Adamax(Optimizer):
-    '''Adamax optimizer from Adam paper's Section 7. It is a variant
-     of Adam based on the infinity norm.
+    """Adamax optimizer from Adam paper's Section 7.
 
+    It is a variant of Adam based on the infinity norm.
     Default parameters follow those provided in the paper.
 
     # Arguments
         lr: float >= 0. Learning rate.
         beta_1/beta_2: floats, 0 < beta < 1. Generally close to 1.
         epsilon: float >= 0. Fuzz factor.
+        decay: float >= 0. Learning rate decay over each update.
 
     # References
         - [Adam - A Method for Stochastic Optimization](http://arxiv.org/abs/1412.6980v8)
-    '''
+    """
+
     def __init__(self, lr=0.002, beta_1=0.9, beta_2=0.999,
                  epsilon=1e-8, decay=0., **kwargs):
         super(Adamax, self).__init__(**kwargs)
-        self.__dict__.update(locals())
-        self.iterations = K.variable(0.)
-        self.lr = K.variable(lr)
-        self.beta_1 = K.variable(beta_1)
-        self.beta_2 = K.variable(beta_2)
-        self.decay = K.variable(decay)
-        self.inital_decay = decay
+        with K.name_scope(self.__class__.__name__):
+            self.iterations = K.variable(0, dtype='int64', name='iterations')
+            self.lr = K.variable(lr, name='lr')
+            self.beta_1 = K.variable(beta_1, name='beta_1')
+            self.beta_2 = K.variable(beta_2, name='beta_2')
+            self.decay = K.variable(decay, name='decay')
+        self.epsilon = epsilon
+        self.initial_decay = decay
 
-    def get_updates(self, params, constraints, loss):
+    @interfaces.legacy_get_updates_support
+    def get_updates(self, loss, params):
         grads = self.get_gradients(loss, params)
         self.updates = [K.update_add(self.iterations, 1)]
 
         lr = self.lr
-        if self.inital_decay > 0:
-            lr *= (1. / (1. + self.decay * self.iterations))
+        if self.initial_decay > 0:
+            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
+                                                  K.dtype(self.decay))))
 
-        t = self.iterations + 1
+        t = K.cast(self.iterations, K.floatx()) + 1
         lr_t = lr / (1. - K.pow(self.beta_1, t))
 
-        shapes = [K.get_variable_shape(p) for p in params]
+        shapes = [K.int_shape(p) for p in params]
         # zero init of 1st moment
         ms = [K.zeros(shape) for shape in shapes]
         # zero init of exponentially weighted infinity norm
@@ -464,12 +510,12 @@ class Adamax(Optimizer):
 
             self.updates.append(K.update(m, m_t))
             self.updates.append(K.update(u, u_t))
-
             new_p = p_t
-            # apply constraints
-            if p in constraints:
-                c = constraints[p]
-                new_p = c(new_p)
+
+            # Apply constraints.
+            if getattr(p, 'constraint', None) is not None:
+                new_p = p.constraint(new_p)
+
             self.updates.append(K.update(p, new_p))
         return self.updates
 
@@ -484,8 +530,9 @@ class Adamax(Optimizer):
 
 
 class Nadam(Optimizer):
-    '''
-    Nesterov Adam optimizer: Much like Adam is essentially RMSprop with momentum,
+    """Nesterov Adam optimizer.
+
+    Much like Adam is essentially RMSprop with momentum,
     Nadam is Adam RMSprop with Nesterov momentum.
 
     Default parameters follow those provided in the paper.
@@ -500,32 +547,35 @@ class Nadam(Optimizer):
     # References
         - [Nadam report](http://cs229.stanford.edu/proj2015/054_report.pdf)
         - [On the importance of initialization and momentum in deep learning](http://www.cs.toronto.edu/~fritz/absps/momentum.pdf)
-    '''
+    """
+
     def __init__(self, lr=0.002, beta_1=0.9, beta_2=0.999,
                  epsilon=1e-8, schedule_decay=0.004, **kwargs):
         super(Nadam, self).__init__(**kwargs)
-        self.__dict__.update(locals())
-        self.iterations = K.variable(0.)
-        self.m_schedule = K.variable(1.)
-        self.lr = K.variable(lr)
-        self.beta_1 = K.variable(beta_1)
-        self.beta_2 = K.variable(beta_2)
+        with K.name_scope(self.__class__.__name__):
+            self.iterations = K.variable(0, dtype='int64', name='iterations')
+            self.m_schedule = K.variable(1., name='m_schedule')
+            self.lr = K.variable(lr, name='lr')
+            self.beta_1 = K.variable(beta_1, name='beta_1')
+            self.beta_2 = K.variable(beta_2, name='beta_2')
+        self.epsilon = epsilon
         self.schedule_decay = schedule_decay
 
-    def get_updates(self, params, constraints, loss):
+    @interfaces.legacy_get_updates_support
+    def get_updates(self, loss, params):
         grads = self.get_gradients(loss, params)
         self.updates = [K.update_add(self.iterations, 1)]
 
-        t = self.iterations + 1
+        t = K.cast(self.iterations, K.floatx()) + 1
 
         # Due to the recommendations in [2], i.e. warming momentum schedule
-        momentum_cache_t = self.beta_1 * (1. - 0.5 * (K.pow(0.96, t * self.schedule_decay)))
-        momentum_cache_t_1 = self.beta_1 * (1. - 0.5 * (K.pow(0.96, (t + 1) * self.schedule_decay)))
+        momentum_cache_t = self.beta_1 * (1. - 0.5 * (K.pow(K.cast_to_floatx(0.96), t * self.schedule_decay)))
+        momentum_cache_t_1 = self.beta_1 * (1. - 0.5 * (K.pow(K.cast_to_floatx(0.96), (t + 1) * self.schedule_decay)))
         m_schedule_new = self.m_schedule * momentum_cache_t
         m_schedule_next = self.m_schedule * momentum_cache_t * momentum_cache_t_1
         self.updates.append((self.m_schedule, m_schedule_new))
 
-        shapes = [K.get_variable_shape(p) for p in params]
+        shapes = [K.int_shape(p) for p in params]
         ms = [K.zeros(shape) for shape in shapes]
         vs = [K.zeros(shape) for shape in shapes]
 
@@ -546,10 +596,10 @@ class Nadam(Optimizer):
             p_t = p - self.lr * m_t_bar / (K.sqrt(v_t_prime) + self.epsilon)
             new_p = p_t
 
-            # apply constraints
-            if p in constraints:
-                c = constraints[p]
-                new_p = c(new_p)
+            # Apply constraints.
+            if getattr(p, 'constraint', None) is not None:
+                new_p = p.constraint(new_p)
+
             self.updates.append(K.update(p, new_p))
         return self.updates
 
@@ -564,19 +614,18 @@ class Nadam(Optimizer):
 
 
 class TFOptimizer(Optimizer):
+    """Wrapper class for native TensorFlow optimizers.
+    """
 
     def __init__(self, optimizer):
         self.optimizer = optimizer
-        self.iterations = K.variable(0.)
-        self.updates = []
+        with K.name_scope(self.__class__.__name__):
+            self.iterations = K.variable(0, dtype='int64', name='iterations')
 
-    def get_updates(self, params, constraints, loss):
-        if constraints:
-            raise ValueError('TF optimizers do not support '
-                             'weights constraints. Either remove '
-                             'all weights constraints in your model, '
-                             'or use a Keras optimizer.')
+    @interfaces.legacy_get_updates_support
+    def get_updates(self, loss, params):
         grads = self.optimizer.compute_gradients(loss, params)
+        self.updates = [K.update_add(self.iterations, 1)]
         opt_update = self.optimizer.apply_gradients(
             grads, global_step=self.iterations)
         self.updates.append(opt_update)
@@ -593,7 +642,8 @@ class TFOptimizer(Optimizer):
         raise NotImplementedError
 
 
-# aliases
+# Aliases.
+
 sgd = SGD
 rmsprop = RMSprop
 adagrad = Adagrad
@@ -603,12 +653,70 @@ adamax = Adamax
 nadam = Nadam
 
 
-def get(identifier, kwargs=None):
+def serialize(optimizer):
+    return serialize_keras_object(optimizer)
+
+
+def deserialize(config, custom_objects=None):
+    """Inverse of the `serialize` function.
+
+    # Arguments
+        config: Optimizer configuration dictionary.
+        custom_objects: Optional dictionary mapping
+            names (strings) to custom objects
+            (classes and functions)
+            to be considered during deserialization.
+
+    # Returns
+        A Keras Optimizer instance.
+    """
+    all_classes = {
+        'sgd': SGD,
+        'rmsprop': RMSprop,
+        'adagrad': Adagrad,
+        'adadelta': Adadelta,
+        'adam': Adam,
+        'adamax': Adamax,
+        'nadam': Nadam,
+        'tfoptimizer': TFOptimizer,
+    }
+    # Make deserialization case-insensitive for built-in optimizers.
+    if config['class_name'].lower() in all_classes:
+        config['class_name'] = config['class_name'].lower()
+    return deserialize_keras_object(config,
+                                    module_objects=all_classes,
+                                    custom_objects=custom_objects,
+                                    printable_module_name='optimizer')
+
+
+def get(identifier):
+    """Retrieves a Keras Optimizer instance.
+
+    # Arguments
+        identifier: Optimizer identifier, one of
+            - String: name of an optimizer
+            - Dictionary: configuration dictionary.
+            - Keras Optimizer instance (it will be returned unchanged).
+            - TensorFlow Optimizer instance
+                (it will be wrapped as a Keras Optimizer).
+
+    # Returns
+        A Keras Optimizer instance.
+
+    # Raises
+        ValueError: If `identifier` cannot be interpreted.
+    """
     if K.backend() == 'tensorflow':
         # Wrap TF optimizer instances
-        import tensorflow as tf
         if isinstance(identifier, tf.train.Optimizer):
             return TFOptimizer(identifier)
-    # Instantiate a Keras optimizer
-    return get_from_module(identifier, globals(), 'optimizer',
-                           instantiate=True, kwargs=kwargs)
+    if isinstance(identifier, dict):
+        return deserialize(identifier)
+    elif isinstance(identifier, six.string_types):
+        config = {'class_name': str(identifier), 'config': {}}
+        return deserialize(config)
+    if isinstance(identifier, Optimizer):
+        return identifier
+    else:
+        raise ValueError('Could not interpret optimizer identifier:',
+                         identifier)
